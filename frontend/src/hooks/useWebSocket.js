@@ -8,10 +8,14 @@ export const useWebSocket = (user = 'HR Manager') => {
 
   useEffect(() => {
     const token = getToken();
-    const websocket = new WebSocket(
-      `ws://localhost:8000/ws?token=${encodeURIComponent(token || '')}`
-    );
+    const wsUrl = import.meta.env.VITE_API_URL 
+      ? import.meta.env.VITE_API_URL.replace('https://', 'wss://').replace('http://', 'ws://')
+      : 'ws://localhost:8000';
     
+    const websocket = new WebSocket(
+      `${wsUrl}/ws?token=${encodeURIComponent(token || '')}`
+    );
+
     websocket.onopen = () => {
       console.log('WebSocket connected');
       setIsConnected(true);
