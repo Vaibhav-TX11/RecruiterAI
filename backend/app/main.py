@@ -43,14 +43,6 @@ except:
     nlp = None
     logger.warning("spaCy model not loaded")
 
-ALLOWED_BASE_PATHS = [
-    "/home",
-    "/mnt",
-    "/data",
-    "C:\\Users",
-    "D:\\",
-    os.path.expanduser("~"),
-]
 
 # Create all tables
 models.Base.metadata.create_all(bind=engine)
@@ -60,7 +52,7 @@ app = FastAPI(title="Candidate Analysis API", version="1.0.0")
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "https://recruiter-ai-trix.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1719,4 +1711,5 @@ def root():
 def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.utcnow()}
+
 
