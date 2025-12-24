@@ -1,9 +1,11 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, WebSocket, WebSocketDisconnect, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from .services.storage_service import storage_service
 import hashlib
 import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import List
 from datetime import datetime
@@ -277,115 +279,312 @@ async def upload_resume(
             os.remove(temp_path)
 
 
-@app.get("/api/filesystem/browse")
-async def browse_filesystem(
-    path: str = "/",
+@app.post("/api/screening/upload-batch", response_model=schemas.BatchResponse)
+async def upload_batch_files(
+    name: str = Form(...),
+    files: List[UploadFile] = File(...),
+    skills: str = Form("[]"),
+    min_experience: int = Form(0),
+    max_experience: int = Form(None),
+    locations: str = Form("[]"),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: models.User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Browse server filesystem to select folders"""
-    try:
-        abs_path = os.path.abspath(path)
-        
-        is_allowed = False
-        for base_path in ALLOWED_BASE_PATHS:
-            base_abs = os.path.abspath(base_path)
-            try:
-                Path(abs_path).relative_to(base_abs)
-                is_allowed = True
-                break
-            except ValueError:
-                continue
-        
-        if not is_allowed:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Access denied. Path must be within allowed directories: {ALLOWED_BASE_PATHS}"
-            )
-        
-        if not os.path.exists(abs_path):
-            raise HTTPException(status_code=404, detail="Path not found")
-        
-        if not os.path.isdir(abs_path):
-            raise HTTPException(status_code=400, detail="Path is not a directory")
-        
-        items = []
-        try:
-            entries = os.listdir(abs_path)
-        except PermissionError:
-            raise HTTPException(status_code=403, detail="Permission denied to access this directory")
-        
-        for entry in sorted(entries):
-            entry_path = os.path.join(abs_path, entry)
-            
-            try:
-                is_dir = os.path.isdir(entry_path)
-                
-                file_count = 0
-                if is_dir:
-                    try:
-                        files = os.listdir(entry_path)
-                        file_count = sum(1 for f in files if f.lower().endswith(('.pdf', '.docx', '.doc')))
-                    except PermissionError:
-                        file_count = 0
-                
-                items.append({
-                    "name": entry,
-                    "path": entry_path,
-                    "is_directory": is_dir,
-                    "size": os.path.getsize(entry_path) if not is_dir else 0,
-                    "resume_count": file_count if is_dir else 0,
-                    "modified": os.path.getmtime(entry_path)
-                })
-            except (PermissionError, OSError):
-                continue
-        
-        parent_path = os.path.dirname(abs_path) if abs_path != "/" else None
-        
-        return {
-            "current_path": abs_path,
-            "parent_path": parent_path,
-            "items": items,
-            "allowed_base_paths": ALLOWED_BASE_PATHS
+    """
+    Upload multiple resumes and create a screening batch
+    """
+    import json
+    
+    # Parse JSON strings
+    skills_list = json.loads(skills) if skills else []
+    locations_list = json.loads(locations) if locations else []
+    
+    # Validate files
+    if not files:
+        raise HTTPException(400, "No files uploaded")
+    
+    # Validate file types
+    allowed_extensions = {'.pdf', '.docx', '.doc', '.txt'}
+    for file in files:
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in allowed_extensions:
+            raise HTTPException(400, f"Invalid file type: {file.filename}. Allowed: PDF, DOCX, TXT")
+    
+    # Create batch
+    batch = crud.create_batch(
+        db,
+        name=name,
+        folder_path=f"batch_{db.query(models.ResumeBatch).count() + 1}",  # Virtual folder
+        created_by=current_user.full_name,
+        filters={
+            'skills': skills_list,
+            'min_experience': min_experience,
+            'max_experience': max_experience,
+            'locations': locations_list
         }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error browsing filesystem: {str(e)}")
+    )
+    
+    # Upload files to Supabase
+    uploaded_files = []
+    for file in files:
+        try:
+            # Read file content
+            content = await file.read()
+            
+            # Upload to Supabase Storage
+            file_path = storage_service.upload_file(
+                content,
+                file.filename,
+                folder=f"batch_{batch.id}"
+            )
+            
+            uploaded_files.append({
+                'filename': file.filename,
+                'path': file_path,
+                'size': len(content)
+            })
+            
+        except Exception as e:
+            logger.error(f"Failed to upload {file.filename}: {e}")
+            continue
+    
+    # Update batch with file count
+    batch.total_resumes = len(uploaded_files)
+    db.commit()
+    
+    # Log activity
+    crud.create_screening_activity(
+        db,
+        batch_id=batch.id,
+        user=current_user.full_name,
+        action="started_screening",
+        details={
+            "batch_name": batch.name,
+            "uploaded_files": len(uploaded_files),
+            "filters": {
+                'skills': skills_list,
+                'min_experience': min_experience,
+                'max_experience': max_experience,
+                'locations': locations_list
+            }
+        }
+    )
+    
+    # Process in background
+    background_tasks.add_task(
+        process_uploaded_batch,
+        batch.id,
+        uploaded_files,
+        {
+            'skills': skills_list,
+            'min_experience': min_experience,
+            'max_experience': max_experience,
+            'locations': locations_list
+        },
+        db
+    )
+    
+    return batch
 
 
-@app.get("/api/filesystem/validate")
-async def validate_folder_path(
-    path: str,
-    current_user: models.User = Depends(get_current_active_user)
-):
-    """Validate if a folder path exists and contains resume files"""
+async def process_uploaded_batch(batch_id: int, uploaded_files: list, filters: dict, db: Session):
+    """Process uploaded batch files from Supabase Storage"""
+    logger.info(f"🚀 Starting batch processing for batch_id: {batch_id}")
+    logger.info(f"📁 Processing {len(uploaded_files)} files")
+    
     try:
-        abs_path = os.path.abspath(path)
+        total = len(uploaded_files)
+        if total == 0:
+            batch = crud.get_batch(db, batch_id)
+            if batch:
+                batch.status = "error"
+                db.commit()
+            return
         
-        if not os.path.exists(abs_path):
-            return {"valid": False, "error": "Path does not exist"}
+        crud.update_batch_progress(db, batch_id, 0, total)
         
-        if not os.path.isdir(abs_path):
-            return {"valid": False, "error": "Path is not a directory"}
+        successful = 0
+        failed = 0
+        failed_files = []
+        
+        for idx, file_info in enumerate(uploaded_files):
+            # Check if batch should continue
+            if not crud.check_batch_should_continue(db, batch_id):
+                batch = crud.get_batch(db, batch_id)
+                if batch and batch.status == "paused":
+                    logger.info(f"\n⏸️  BATCH PAUSED at {idx}/{total}")
+                elif batch and batch.status == "cancelled":
+                    logger.info(f"\n❌ BATCH CANCELLED at {idx}/{total}")
+                return
+            
+            filename = file_info['filename']
+            file_path = file_info['path']
+            
+            try:
+                logger.info(f"\n📄 Processing {idx+1}/{total}: {filename}")
+                
+                # Download file from Supabase
+                file_content = storage_service.download_file(file_path)
+                
+                # Create temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
+                    temp_file.write(file_content)
+                    temp_file_path = temp_file.name
+                
+                ext = os.path.splitext(filename)[1]
+                
+                # Extract text
+                resume_text = parser.extract_text(temp_file_path, ext)
+                
+                # Clean up temp file
+                os.unlink(temp_file_path)
+                
+                if not resume_text or len(resume_text) < 100:
+                    logger.warning(f"⚠️  Skipping - insufficient text")
+                    failed += 1
+                    failed_files.append((filename, "Insufficient text"))
+                    continue
+                
+                resume_text = sanitize_text(resume_text)
+                
+                if len(resume_text) < 100:
+                    logger.warning(f"⚠️  Skipping - text too short after sanitization")
+                    failed += 1
+                    failed_files.append((filename, "Text too short"))
+                    continue
+                
+                # Extract information
+                extracted = extractor.extract_all(resume_text, filename)
+                
+                logger.info(f"   👤 Name: {extracted['name']}")
+                logger.info(f"   📧 Email: {extracted.get('email') or 'N/A'}")
+                logger.info(f"   🔧 Skills: {len(extracted.get('skills', []))} found")
+                
+                exp_years = extracted.get('experience_years', 0)
+                location = extracted.get('location', 'Not Specified')
+                
+                # Apply filters
+                if not matcher.matches_filters(extracted, exp_years, location, filters):
+                    logger.info(f"   ❌ Filtered out (doesn't match criteria)")
+                    failed += 1
+                    failed_files.append((filename, "Doesn't match filters"))
+                    continue
+                
+                # Calculate match score
+                match_score = matcher.calculate_screening_score(
+                    extracted.get('skills', []),
+                    filters.get('skills', []),
+                    exp_years,
+                    filters.get('min_experience', 0),
+                    resume_text
+                )
+                
+                logger.info(f"   ⭐ Match Score: {match_score}%")
+                
+                # Generate unique hash
+                email_for_hash = extracted.get('email') or ''
+                unique_hash = hashlib.md5(
+                    f"{extracted['name']}{email_for_hash}".encode()
+                ).hexdigest()
+                
+                # Check for duplicates
+                existing = db.query(models.Potential).filter(
+                    models.Potential.batch_id == batch_id,
+                    models.Potential.unique_hash == unique_hash
+                ).first()
+                
+                if existing:
+                    logger.info(f"   ⚠️  Duplicate detected")
+                    failed += 1
+                    failed_files.append((filename, "Duplicate"))
+                    continue
+                
+                # Prepare data
+                potential_data = {
+                    'unique_hash': unique_hash,
+                    'name': sanitize_text(extracted['name']),
+                    'email': sanitize_text(extracted.get('email') or ''),
+                    'phone': sanitize_text(extracted.get('phone') or ''),
+                    'skills': [sanitize_text(s) for s in extracted.get('skills', [])],
+                    'experience_years': exp_years,
+                    'location': sanitize_text(location),
+                    'education': [
+                        {k: sanitize_text(str(v)) if v else '' for k, v in edu.items()}
+                        for edu in extracted.get('education', [])
+                    ],
+                    'resume_text': sanitize_text(resume_text[:5000]),
+                    'resume_filename': sanitize_text(filename),
+                    'resume_path': file_path,  # Store Supabase path
+                    'match_score': match_score
+                }
+                
+                try:
+                    crud.create_potential(db, batch_id, potential_data)
+                    db.commit()
+                    successful += 1
+                    logger.info(f"   ✅ Success!")
+                    
+                except Exception as db_error:
+                    logger.error(f"   ❌ Database error: {str(db_error)}")
+                    db.rollback()
+                    failed += 1
+                    failed_files.append((filename, f"DB Error: {str(db_error)[:50]}"))
+                    continue
+                
+            except Exception as e:
+                failed += 1
+                error_msg = str(e)[:100]
+                logger.error(f"   ❌ Error: {error_msg}")
+                failed_files.append((filename, error_msg))
+                
+                try:
+                    db.rollback()
+                except:
+                    pass
+                
+                continue
+            
+            finally:
+                try:
+                    crud.update_batch_progress(db, batch_id, idx + 1, total)
+                except Exception as progress_error:
+                    logger.warning(f"   ⚠️  Could not update progress: {progress_error}")
+        
+        # Mark batch as complete
+        logger.info(f"\n" + "="*60)
+        logger.info(f"🎉 BATCH PROCESSING COMPLETE!")
+        logger.info(f"="*60)
+        logger.info(f"✅ Successful: {successful}/{total} ({(successful/total*100):.1f}%)")
+        logger.info(f"❌ Failed: {failed}/{total} ({(failed/total*100):.1f}%)")
+        
+        if failed_files:
+            logger.info(f"\n📋 Failed Files Summary:")
+            for fname, reason in failed_files[:10]:
+                logger.info(f"   • {fname}: {reason}")
+            if len(failed_files) > 10:
+                logger.info(f"   ... and {len(failed_files) - 10} more")
+        
+        logger.info("="*60 + "\n")
         
         try:
-            files = os.listdir(abs_path)
-            resume_files = [f for f in files if f.lower().endswith(('.pdf', '.docx', '.doc'))]
-            
-            return {
-                "valid": True,
-                "path": abs_path,
-                "total_files": len(files),
-                "resume_files": len(resume_files),
-                "file_list": resume_files[:10]
-            }
-        except PermissionError:
-            return {"valid": False, "error": "Permission denied to access directory"}
-            
+            crud.update_batch_progress(db, batch_id, total, total)
+        except:
+            pass
+    
     except Exception as e:
-        return {"valid": False, "error": str(e)}
+        logger.error(f"\n💥 CRITICAL ERROR in batch processing:")
+        logger.error(f"   {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        try:
+            batch = crud.get_batch(db, batch_id)
+            if batch:
+                batch.status = "error"
+                db.commit()
+        except:
+            pass
 
 
 # ============================================
