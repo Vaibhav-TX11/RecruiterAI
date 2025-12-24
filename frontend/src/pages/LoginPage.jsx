@@ -306,15 +306,6 @@ export default function LoginPage() {
               </button>
             </form>
           )}
-
-          {/* Demo Credentials */}
-          <div className="mt-6 p-4 bg-gray-50 rounded-lg">
-            <p className="text-sm font-medium text-gray-700 mb-2">Demo Credentials:</p>
-            <p className="text-xs text-gray-600">Username: <span className="font-mono">admin</span></p>
-            <p className="text-xs text-gray-600">Password: <span className="font-mono">admin123</span></p>
-          </div>
-        </div>
-
         {/* Footer */}
         <p className="text-center text-sm text-gray-600 mt-6">
           By signing in, you agree to our Terms of Service and Privacy Policy
@@ -322,4 +313,5 @@ export default function LoginPage() {
       </div>
     </div>
   );
+
 }
