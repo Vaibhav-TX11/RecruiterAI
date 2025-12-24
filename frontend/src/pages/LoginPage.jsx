@@ -307,6 +307,7 @@ export default function LoginPage() {
             </form>
           )}
         </div>
+
         {/* Footer */}
         <p className="text-center text-sm text-gray-600 mt-6">
           By signing in, you agree to our Terms of Service and Privacy Policy
@@ -314,6 +315,4 @@ export default function LoginPage() {
       </div>
     </div>
   );
-
 }
-
