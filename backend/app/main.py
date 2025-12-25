@@ -1,88 +1,204 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, WebSocket, WebSocketDisconnect, Query, Form
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from .services.storage_service import storage_service
-import hashlib
 import os
+import sys
+import logging
+import hashlib
 import shutil
 import tempfile
-from pathlib import Path
+import glob
 from typing import List
 from datetime import datetime
-from .database import engine, get_db
-from . import models, schemas, crud
-from .services.parser import DocumentParser
-from .services.extractor import InformationExtractor
-from .services.matcher import CandidateMatcher
-from .services.websocket_manager import manager
-from .auth import create_access_token, get_current_user, get_current_active_user
-from .permissions import (
-    require_permission,
-    require_roles,
-    require_min_role,
-    can_modify_candidate,
-    can_delete_comment,
-    get_user_permissions
-)
-from fastapi import BackgroundTasks
-import asyncio
-import glob
-import logging
 
-# Configure logging
+# ============================================
+# LOGGING SETUP (MUST BE FIRST)
+# ============================================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
+logger.info("=" * 70)
+logger.info("🚀 STARTING RECRUITER AI APPLICATION")
+logger.info("=" * 70)
+
+# ============================================
+# ENVIRONMENT VALIDATION
+# ============================================
+logger.info("🔍 Validating environment variables...")
+required_vars = ["DATABASE_URL", "SECRET_KEY"]
+missing_vars = [var for var in required_vars if not os.getenv(var)]
+
+if missing_vars:
+    logger.error(f"❌ Missing required environment variables: {', '.join(missing_vars)}")
+    sys.exit(1)
+
+logger.info("✅ All required environment variables present")
+
+# ============================================
+# CORE IMPORTS
+# ============================================
+logger.info("📦 Importing FastAPI and core dependencies...")
+from fastapi import (
+    FastAPI, UploadFile, File, HTTPException, Depends, 
+    WebSocket, WebSocketDisconnect, Query, Form, BackgroundTasks
+)
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+
+logger.info("✅ FastAPI imports successful")
+
+# ============================================
+# DATABASE SETUP
+# ============================================
+logger.info("📦 Initializing database...")
 try:
-    import spacy
-    nlp = spacy.load("en_core_web_sm")
-except:
-    nlp = None
-    logger.warning("spaCy model not loaded")
+    from app.database import engine, get_db
+    from app import models, schemas, crud
+    
+    # Create tables
+    models.Base.metadata.create_all(bind=engine)
+    logger.info("✅ Database initialized and tables created")
+except Exception as e:
+    logger.error(f"❌ Database initialization failed: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
 
+# ============================================
+# SERVICE IMPORTS
+# ============================================
+logger.info("📦 Loading services...")
+try:
+    from app.services.parser import DocumentParser
+    from app.services.extractor import InformationExtractor
+    from app.services.matcher import CandidateMatcher
+    from app.services.websocket_manager import manager
+    from app.services.storage_service import storage_service
+    
+    logger.info("✅ Core services loaded")
+except Exception as e:
+    logger.error(f"❌ Service import failed: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
 
-# Create all tables
-models.Base.metadata.create_all(bind=engine)
+# ============================================
+# AUTH IMPORTS
+# ============================================
+logger.info("📦 Loading authentication modules...")
+try:
+    from app.auth import create_access_token, get_current_user, get_current_active_user
+    from app.permissions import (
+        require_permission, require_roles, require_min_role,
+        can_modify_candidate, can_delete_comment, get_user_permissions
+    )
+    logger.info("✅ Authentication modules loaded")
+except Exception as e:
+    logger.error(f"❌ Auth import failed: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
 
-app = FastAPI(title="Candidate Analysis API", version="1.0.0")
+# ============================================
+# CREATE FASTAPI APP
+# ============================================
+logger.info("🚀 Creating FastAPI application...")
+app = FastAPI(
+    title="Candidate Analysis API",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
-# CORS
+# ============================================
+# CORS CONFIGURATION
+# ============================================
+logger.info("🔌 Configuring CORS...")
+allowed_origins = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:5173,http://localhost:3000,https://recruiter-ai-trix.vercel.app"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "https://recruiter-ai-trix.vercel.app"],
+    allow_origins=[origin.strip() for origin in allowed_origins],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+logger.info(f"✅ CORS configured for {len(allowed_origins)} origins")
 
-# Initialize services
+# ============================================
+# SERVICE INITIALIZATION
+# ============================================
+logger.info("⚙️  Initializing services...")
 parser = DocumentParser()
 extractor = InformationExtractor()
 matcher = CandidateMatcher()
+logger.info("✅ Services initialized")
 
+# ============================================
+# FILE UPLOAD SETUP
+# ============================================
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+logger.info(f"✅ Upload directory ready: {UPLOAD_DIR}")
 
-
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
 def sanitize_text(text: str) -> str:
-    """Remove null bytes and other problematic characters"""
+    """Remove null bytes and problematic characters"""
     if not text:
         return ""
-    
     text = text.replace('\x00', '')
     text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\t\r')
-    
     return text.strip()
 
+# ============================================
+# STARTUP/SHUTDOWN EVENTS
+# ============================================
+@app.on_event("startup")
+async def startup_event():
+    """App startup event"""
+    logger.info("=" * 70)
+    logger.info("✅ FastAPI application started successfully!")
+    logger.info(f"📊 Environment: {os.getenv('ENVIRONMENT', 'production')}")
+    logger.info(f"🌐 CORS Origins: {len(allowed_origins)} configured")
+    logger.info(f"📁 Upload directory: {UPLOAD_DIR}")
+    logger.info("=" * 70)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """App shutdown event"""
+    logger.info("🛑 Application shutting down gracefully")
+
+# ============================================
+# HEALTH CHECK ENDPOINTS (CRITICAL!)
+# ============================================
+@app.get("/")
+def root():
+    """Root endpoint"""
+    return {
+        "message": "Candidate Analysis System API",
+        "version": "1.0.0",
+        "status": "running",
+        "docs": "/docs"
+    }
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint for Render"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow(),
+        "app": "candidate-analysis-api"
+    }
 
 # ============================================
 # AUTHENTICATION ROUTES
 # ============================================
-
-
 @app.post("/api/auth/register", response_model=schemas.User)
 def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
     """Register a new user"""
@@ -95,7 +211,6 @@ def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Email already registered")
 
     return crud.create_user(db, user)
-
 
 @app.post("/api/auth/login", response_model=schemas.Token)
 def login(user_credentials: schemas.UserLogin, db: Session = Depends(get_db)):
@@ -114,23 +229,19 @@ def login(user_credentials: schemas.UserLogin, db: Session = Depends(get_db)):
         "user": user
     }
 
-
 @app.get("/api/auth/me", response_model=schemas.User)
 async def get_me(current_user: models.User = Depends(get_current_active_user)):
     """Get current user info"""
     return current_user
-
 
 @app.post("/api/auth/logout")
 async def logout(current_user: models.User = Depends(get_current_active_user)):
     """Logout user"""
     return {"message": "Successfully logged out"}
 
-
 # ============================================
 # WEBSOCKET
 # ============================================
-
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -139,7 +250,7 @@ async def websocket_endpoint(
 ):
     """WebSocket endpoint with authentication"""
     if token:
-        from .auth import verify_token
+        from app.auth import verify_token
         user_id = verify_token(token)
         if user_id:
             user = crud.get_user(db, user_id)
@@ -160,11 +271,9 @@ async def websocket_endpoint(
         if user:
             await manager.broadcast({"type": "user_disconnected", "user": user})
 
-
 # ============================================
-# RESUME ROUTES
+# RESUME UPLOAD ROUTE
 # ============================================
-
 @app.post("/api/resumes/upload")
 async def upload_resume(
     file: UploadFile = File(...),
@@ -179,18 +288,13 @@ async def upload_resume(
         with open(temp_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        # Extract text with improved parser
         resume_text = parser.extract_text(temp_path, ext)
-        
-        # Extract information with improved extractor
         extracted = extractor.extract_all(resume_text, file.filename)
         
-        # Generate unique hash
         unique_hash = hashlib.md5(
             f"{extracted['name']}{extracted['email']}".encode()
         ).hexdigest()
 
-        # Check if blacklisted
         blacklisted = crud.check_if_blacklisted(
             db,
             email=extracted['email'],
@@ -211,7 +315,6 @@ async def upload_resume(
                 }
             }
 
-        # Check for duplicates
         existing = crud.get_candidate_by_hash(db, unique_hash)
         if existing:
             return {
@@ -220,7 +323,6 @@ async def upload_resume(
                 "candidate_id": existing.id
             }
 
-        # Create candidate
         candidate_data = schemas.CandidateCreate(
             unique_hash=unique_hash,
             name=extracted["name"],
@@ -270,7 +372,9 @@ async def upload_resume(
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-
+# ============================================
+# BATCH UPLOAD ROUTES
+# ============================================
 @app.post("/api/screening/upload-batch", response_model=schemas.BatchResponse)
 async def upload_batch_files(
     name: str = Form(...),
@@ -283,31 +387,25 @@ async def upload_batch_files(
     current_user: models.User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Upload multiple resumes and create a screening batch
-    """
+    """Upload batch files"""
     import json
     
-    # Parse JSON strings
     skills_list = json.loads(skills) if skills else []
     locations_list = json.loads(locations) if locations else []
     
-    # Validate files
     if not files:
         raise HTTPException(400, "No files uploaded")
     
-    # Validate file types
     allowed_extensions = {'.pdf', '.docx', '.doc', '.txt'}
     for file in files:
         ext = os.path.splitext(file.filename)[1].lower()
         if ext not in allowed_extensions:
-            raise HTTPException(400, f"Invalid file type: {file.filename}. Allowed: PDF, DOCX, TXT")
+            raise HTTPException(400, f"Invalid file type: {file.filename}")
     
-    # Create batch
     batch = crud.create_batch(
         db,
         name=name,
-        folder_path=f"batch_{db.query(models.ResumeBatch).count() + 1}",  # Virtual folder
+        folder_path=f"batch_{db.query(models.ResumeBatch).count() + 1}",
         created_by=current_user.full_name,
         filters={
             'skills': skills_list,
@@ -317,35 +415,27 @@ async def upload_batch_files(
         }
     )
     
-    # Upload files to Supabase
     uploaded_files = []
     for file in files:
         try:
-            # Read file content
             content = await file.read()
-            
-            # Upload to Supabase Storage
             file_path = storage_service.upload_file(
                 content,
                 file.filename,
                 folder=f"batch_{batch.id}"
             )
-            
             uploaded_files.append({
                 'filename': file.filename,
                 'path': file_path,
                 'size': len(content)
             })
-            
         except Exception as e:
             logger.error(f"Failed to upload {file.filename}: {e}")
             continue
     
-    # Update batch with file count
     batch.total_resumes = len(uploaded_files)
     db.commit()
     
-    # Log activity
     crud.create_screening_activity(
         db,
         batch_id=batch.id,
@@ -363,7 +453,6 @@ async def upload_batch_files(
         }
     )
     
-    # Process in background
     background_tasks.add_task(
         process_uploaded_batch,
         batch.id,
@@ -379,11 +468,9 @@ async def upload_batch_files(
     
     return batch
 
-
 async def process_uploaded_batch(batch_id: int, uploaded_files: list, filters: dict, db: Session):
-    """Process uploaded batch files from Supabase Storage"""
+    """Process uploaded batch files"""
     logger.info(f"🚀 Starting batch processing for batch_id: {batch_id}")
-    logger.info(f"📁 Processing {len(uploaded_files)} files")
     
     try:
         total = len(uploaded_files)
@@ -395,75 +482,43 @@ async def process_uploaded_batch(batch_id: int, uploaded_files: list, filters: d
             return
         
         crud.update_batch_progress(db, batch_id, 0, total)
-        
         successful = 0
         failed = 0
-        failed_files = []
         
         for idx, file_info in enumerate(uploaded_files):
-            # Check if batch should continue
             if not crud.check_batch_should_continue(db, batch_id):
-                batch = crud.get_batch(db, batch_id)
-                if batch and batch.status == "paused":
-                    logger.info(f"\n⏸️  BATCH PAUSED at {idx}/{total}")
-                elif batch and batch.status == "cancelled":
-                    logger.info(f"\n❌ BATCH CANCELLED at {idx}/{total}")
                 return
             
             filename = file_info['filename']
             file_path = file_info['path']
+            temp_file_path = None
             
             try:
-                logger.info(f"\n📄 Processing {idx+1}/{total}: {filename}")
+                logger.info(f"📄 Processing {idx+1}/{total}: {filename}")
                 
-                # Download file from Supabase
                 file_content = storage_service.download_file(file_path)
                 
-                # Create temporary file
                 with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
                     temp_file.write(file_content)
                     temp_file_path = temp_file.name
                 
                 ext = os.path.splitext(filename)[1]
-                
-                # Extract text
                 resume_text = parser.extract_text(temp_file_path, ext)
                 
-                # Clean up temp file
-                os.unlink(temp_file_path)
-                
                 if not resume_text or len(resume_text) < 100:
-                    logger.warning(f"⚠️  Skipping - insufficient text")
                     failed += 1
-                    failed_files.append((filename, "Insufficient text"))
                     continue
                 
                 resume_text = sanitize_text(resume_text)
-                
-                if len(resume_text) < 100:
-                    logger.warning(f"⚠️  Skipping - text too short after sanitization")
-                    failed += 1
-                    failed_files.append((filename, "Text too short"))
-                    continue
-                
-                # Extract information
                 extracted = extractor.extract_all(resume_text, filename)
-                
-                logger.info(f"   👤 Name: {extracted['name']}")
-                logger.info(f"   📧 Email: {extracted.get('email') or 'N/A'}")
-                logger.info(f"   🔧 Skills: {len(extracted.get('skills', []))} found")
                 
                 exp_years = extracted.get('experience_years', 0)
                 location = extracted.get('location', 'Not Specified')
                 
-                # Apply filters
                 if not matcher.matches_filters(extracted, exp_years, location, filters):
-                    logger.info(f"   ❌ Filtered out (doesn't match criteria)")
                     failed += 1
-                    failed_files.append((filename, "Doesn't match filters"))
                     continue
                 
-                # Calculate match score
                 match_score = matcher.calculate_screening_score(
                     extracted.get('skills', []),
                     filters.get('skills', []),
@@ -472,277 +527,20 @@ async def process_uploaded_batch(batch_id: int, uploaded_files: list, filters: d
                     resume_text
                 )
                 
-                logger.info(f"   ⭐ Match Score: {match_score}%")
-                
-                # Generate unique hash
                 email_for_hash = extracted.get('email') or ''
                 unique_hash = hashlib.md5(
                     f"{extracted['name']}{email_for_hash}".encode()
                 ).hexdigest()
                 
-                # Check for duplicates
                 existing = db.query(models.Potential).filter(
                     models.Potential.batch_id == batch_id,
                     models.Potential.unique_hash == unique_hash
                 ).first()
                 
                 if existing:
-                    logger.info(f"   ⚠️  Duplicate detected")
                     failed += 1
-                    failed_files.append((filename, "Duplicate"))
                     continue
                 
-                # Prepare data
-                potential_data = {
-                    'unique_hash': unique_hash,
-                    'name': sanitize_text(extracted['name']),
-                    'email': sanitize_text(extracted.get('email') or ''),
-                    'phone': sanitize_text(extracted.get('phone') or ''),
-                    'skills': [sanitize_text(s) for s in extracted.get('skills', [])],
-                    'experience_years': exp_years,
-                    'location': sanitize_text(location),
-                    'education': [
-                        {k: sanitize_text(str(v)) if v else '' for k, v in edu.items()}
-                        for edu in extracted.get('education', [])
-                    ],
-                    'resume_text': sanitize_text(resume_text[:5000]),
-                    'resume_filename': sanitize_text(filename),
-                    'resume_path': file_path,  # Store Supabase path
-                    'match_score': match_score
-                }
-                
-                try:
-                    crud.create_potential(db, batch_id, potential_data)
-                    db.commit()
-                    successful += 1
-                    logger.info(f"   ✅ Success!")
-                    
-                except Exception as db_error:
-                    logger.error(f"   ❌ Database error: {str(db_error)}")
-                    db.rollback()
-                    failed += 1
-                    failed_files.append((filename, f"DB Error: {str(db_error)[:50]}"))
-                    continue
-                
-            except Exception as e:
-                failed += 1
-                error_msg = str(e)[:100]
-                logger.error(f"   ❌ Error: {error_msg}")
-                failed_files.append((filename, error_msg))
-                
-                try:
-                    db.rollback()
-                except:
-                    pass
-                
-                continue
-            
-            finally:
-                try:
-                    crud.update_batch_progress(db, batch_id, idx + 1, total)
-                except Exception as progress_error:
-                    logger.warning(f"   ⚠️  Could not update progress: {progress_error}")
-        
-        # Mark batch as complete
-        logger.info(f"\n" + "="*60)
-        logger.info(f"🎉 BATCH PROCESSING COMPLETE!")
-        logger.info(f"="*60)
-        logger.info(f"✅ Successful: {successful}/{total} ({(successful/total*100):.1f}%)")
-        logger.info(f"❌ Failed: {failed}/{total} ({(failed/total*100):.1f}%)")
-        
-        if failed_files:
-            logger.info(f"\n📋 Failed Files Summary:")
-            for fname, reason in failed_files[:10]:
-                logger.info(f"   • {fname}: {reason}")
-            if len(failed_files) > 10:
-                logger.info(f"   ... and {len(failed_files) - 10} more")
-        
-        logger.info("="*60 + "\n")
-        
-        try:
-            crud.update_batch_progress(db, batch_id, total, total)
-        except:
-            pass
-    
-    except Exception as e:
-        logger.error(f"\n💥 CRITICAL ERROR in batch processing:")
-        logger.error(f"   {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        try:
-            batch = crud.get_batch(db, batch_id)
-            if batch:
-                batch.status = "error"
-                db.commit()
-        except:
-            pass
-
-
-# ============================================
-# SCREENING
-# ============================================
-
-@app.post("/api/screening/start", response_model=schemas.BatchResponse)
-async def start_screening(
-    batch_data: schemas.BatchCreate,
-    background_tasks: BackgroundTasks,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
-):
-    """Start a new screening batch"""
-    batch = crud.create_batch(
-        db,
-        name=batch_data.name,
-        folder_path=batch_data.folder_path,
-        created_by=current_user.full_name,
-        filters=batch_data.filters.dict()
-    )
-
-    crud.create_screening_activity(
-        db,
-        batch_id=batch.id,
-        user=current_user.full_name,
-        action="started_screening",
-        details={
-            "batch_name": batch.name,
-            "folder_path": batch.folder_path,
-            "filters": batch_data.filters.dict()
-        }
-    )
-
-    background_tasks.add_task(
-        process_batch_resumes,
-        batch.id,
-        batch.folder_path,
-        batch_data.filters.dict(),
-        db
-    )
-
-    return batch
-
-
-async def process_batch_resumes(batch_id: int, folder_path: str, filters: dict, db: Session):
-    """Background task to process resumes with PAUSE/CANCEL support"""
-    logger.info(f"🚀 Starting batch processing for batch_id: {batch_id}")
-    logger.info(f"📁 Folder path: {folder_path}")
-    logger.info(f"🔍 Filters: {filters}")
-    
-    try:
-        # Get all PDF/DOCX files from folder
-        patterns = [
-            os.path.join(folder_path, "*.pdf"),
-            os.path.join(folder_path, "*.PDF"),
-            os.path.join(folder_path, "*.docx"),
-            os.path.join(folder_path, "*.DOCX"),
-            os.path.join(folder_path, "*.doc"),
-            os.path.join(folder_path, "*.DOC")
-        ]
-
-        files = []
-        for pattern in patterns:
-            found_files = glob.glob(pattern)
-            files.extend(found_files)
-
-        files = list(set(files))
-        total = len(files)
-        logger.info(f"✅ Found {total} resume files to process")
-        
-        if total == 0:
-            batch = crud.get_batch(db, batch_id)
-            if batch:
-                batch.status = "error"
-                db.commit()
-            return
-
-        crud.update_batch_progress(db, batch_id, 0, total)
-
-        successful = 0
-        failed = 0
-        failed_files = []
-
-        for idx, file_path in enumerate(files):
-            # Check if batch is paused or cancelled
-            if not crud.check_batch_should_continue(db, batch_id):
-                batch = crud.get_batch(db, batch_id)
-                if batch and batch.status == "paused":
-                    logger.info(f"\n⏸️  BATCH PAUSED at {idx}/{total}")
-                elif batch and batch.status == "cancelled":
-                    logger.info(f"\n❌ BATCH CANCELLED at {idx}/{total}")
-                return
-            
-            filename = os.path.basename(file_path)
-            
-            try:
-                logger.info(f"\n📄 Processing {idx+1}/{total}: {filename}")
-                
-                ext = os.path.splitext(file_path)[1]
-                
-                # Use improved parser
-                resume_text = parser.extract_text(file_path, ext)
-                
-                if not resume_text or len(resume_text) < 100:
-                    logger.warning(f"⚠️  Skipping - insufficient text")
-                    failed += 1
-                    failed_files.append((filename, "Insufficient text"))
-                    continue
-
-                resume_text = sanitize_text(resume_text)
-                
-                if len(resume_text) < 100:
-                    logger.warning(f"⚠️  Skipping - text too short after sanitization")
-                    failed += 1
-                    failed_files.append((filename, "Text too short"))
-                    continue
-
-                # Use improved extractor with filename
-                extracted = extractor.extract_all(resume_text, filename)
-                
-                logger.info(f"   👤 Name: {extracted['name']}")
-                logger.info(f"   📧 Email: {extracted.get('email') or 'N/A'}")
-                logger.info(f"   🔧 Skills: {len(extracted.get('skills', []))} found")
-                
-                # Use extracted experience years
-                exp_years = extracted.get('experience_years', 0)
-                location = extracted.get('location', 'Not Specified')
-                
-                # Use matcher for filtering
-                if not matcher.matches_filters(extracted, exp_years, location, filters):
-                    logger.info(f"   ❌ Filtered out (doesn't match criteria)")
-                    failed += 1
-                    failed_files.append((filename, "Doesn't match filters"))
-                    continue
-                
-                # Use matcher for scoring
-                match_score = matcher.calculate_screening_score(
-                    extracted.get('skills', []),
-                    filters.get('skills', []),
-                    exp_years,
-                    filters.get('min_experience', 0),
-                    resume_text
-                )
-                
-                logger.info(f"   ⭐ Match Score: {match_score}%")
-                
-                # Generate unique hash
-                email_for_hash = extracted.get('email') or ''
-                unique_hash = hashlib.md5(
-                    f"{extracted['name']}{email_for_hash}".encode()
-                ).hexdigest()
-                
-                # Check for duplicates
-                existing = db.query(models.Potential).filter(
-                    models.Potential.batch_id == batch_id,
-                    models.Potential.unique_hash == unique_hash
-                ).first()
-                
-                if existing:
-                    logger.info(f"   ⚠️  Duplicate detected")
-                    failed += 1
-                    failed_files.append((filename, "Duplicate"))
-                    continue
-                
-                # Prepare data
                 potential_data = {
                     'unique_hash': unique_hash,
                     'name': sanitize_text(extracted['name']),
@@ -766,73 +564,34 @@ async def process_batch_resumes(batch_id: int, folder_path: str, filters: dict, 
                     db.commit()
                     successful += 1
                     logger.info(f"   ✅ Success!")
-                    
                 except Exception as db_error:
                     logger.error(f"   ❌ Database error: {str(db_error)}")
                     db.rollback()
                     failed += 1
-                    failed_files.append((filename, f"DB Error: {str(db_error)[:50]}"))
-                    continue
-                
-            except ValueError as e:
-                failed += 1
-                error_msg = str(e)[:100]
-                logger.error(f"   ❌ Validation Error: {error_msg}")
-                failed_files.append((filename, error_msg))
-                
-                try:
-                    db.rollback()
-                except:
-                    pass
-                
-                continue
                 
             except Exception as e:
                 failed += 1
-                error_msg = str(e)[:100]
-                logger.error(f"   ❌ Error: {error_msg}")
-                failed_files.append((filename, error_msg))
-                
+                logger.error(f"   ❌ Error: {str(e)[:100]}")
                 try:
                     db.rollback()
                 except:
                     pass
-                
-                continue
             
             finally:
+                if temp_file_path and os.path.exists(temp_file_path):
+                    try:
+                        os.unlink(temp_file_path)
+                    except:
+                        pass
                 try:
                     crud.update_batch_progress(db, batch_id, idx + 1, total)
-                except Exception as progress_error:
-                    logger.warning(f"   ⚠️  Could not update progress: {progress_error}")
+                except:
+                    pass
         
-        # Mark batch as complete
-        logger.info(f"\n" + "="*60)
-        logger.info(f"🎉 BATCH PROCESSING COMPLETE!")
-        logger.info(f"="*60)
-        logger.info(f"✅ Successful: {successful}/{total} ({(successful/total*100):.1f}%)")
-        logger.info(f"❌ Failed: {failed}/{total} ({(failed/total*100):.1f}%)")
+        logger.info(f"🎉 Batch complete! ✅ {successful}/{total} | ❌ {failed}/{total}")
         
-        if failed_files:
-            logger.info(f"\n📋 Failed Files Summary:")
-            for fname, reason in failed_files[:10]:
-                logger.info(f"   • {fname}: {reason}")
-            if len(failed_files) > 10:
-                logger.info(f"   ... and {len(failed_files) - 10} more")
-        
-        logger.info("="*60 + "\n")
-        
-        try:
-            crud.update_batch_progress(db, batch_id, total, total)
-        except:
-            pass
-
     except Exception as e:
-        logger.error(f"\n💥 CRITICAL ERROR in batch processing:")
-        logger.error(f"   {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
+        logger.error(f"💥 Batch processing error: {str(e)}")
         try:
             batch = crud.get_batch(db, batch_id)
             if batch:
@@ -841,12 +600,9 @@ async def process_batch_resumes(batch_id: int, folder_path: str, filters: dict, 
         except:
             pass
 
-
-async def process_batch_resumes_resume(batch_id: int, folder_path: str, filters: dict, db: Session):
-    """Resume batch processing from where it was paused"""
-    await process_batch_resumes(batch_id, folder_path, filters, db)
-
-
+# ============================================
+# SCREENING ROUTES
+# ============================================
 @app.get("/api/screening/potentials/{batch_id}")
 async def get_potentials(
     batch_id: int,
@@ -871,7 +627,6 @@ async def get_potentials(
         "per_page": per_page,
         "total_pages": (total + per_page - 1) // per_page
     }
-
 
 @app.put("/api/screening/potentials/{potential_id}/status")
 async def update_potential_status_endpoint(
@@ -912,7 +667,6 @@ async def update_potential_status_endpoint(
 
     if status_update.status == "interested":
         candidate = crud.promote_to_candidate(db, potential_id)
-
         crud.create_activity_log(
             db,
             user=current_user.full_name,
@@ -920,7 +674,6 @@ async def update_potential_status_endpoint(
             candidate_id=candidate.id,
             details={"candidate_name": candidate.name}
         )
-
         await manager.broadcast({
             "type": "potential_promoted",
             "potential_id": potential_id,
@@ -929,14 +682,12 @@ async def update_potential_status_endpoint(
 
     elif status_update.status == "not_interested":
         crud.reject_potential(db, potential_id, current_user.full_name)
-
         await manager.broadcast({
             "type": "potential_rejected",
             "potential_id": potential_id
         })
 
     return potential
-
 
 @app.get("/api/screening/activities/{batch_id}")
 async def get_screening_activities_endpoint(
@@ -948,16 +699,14 @@ async def get_screening_activities_endpoint(
     """Get screening activities"""
     return crud.get_screening_activities(db, batch_id, limit)
 
-
 @app.get("/api/screening/rejected/{batch_id}")
 async def get_rejected_list(
     batch_id: int,
     current_user: models.User = Depends(require_permission("view_activity")),
     db: Session = Depends(get_db)
 ):
-    """Get rejected potentials for manual cleanup"""
+    """Get rejected potentials"""
     return crud.get_rejected_potentials(db, batch_id)
-
 
 @app.get("/api/screening/batches")
 async def get_batches(
@@ -965,13 +714,181 @@ async def get_batches(
     db: Session = Depends(get_db)
 ):
     """Get all screening batches"""
-    batches = crud.get_active_batches(db)
-    return batches
+    return crud.get_active_batches(db)
 
+@app.post("/api/screening/start", response_model=schemas.BatchResponse)
+async def start_screening(
+    batch_data: schemas.BatchCreate,
+    background_tasks: BackgroundTasks,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Start a new screening batch"""
+    batch = crud.create_batch(
+        db,
+        name=batch_data.name,
+        folder_path=batch_data.folder_path,
+        created_by=current_user.full_name,
+        filters=batch_data.filters.dict()
+    )
 
-# ============================================
-# BATCH MANAGEMENT ENDPOINTS
-# ============================================
+    crud.create_screening_activity(
+        db,
+        batch_id=batch.id,
+        user=current_user.full_name,
+        action="started_screening",
+        details={
+            "batch_name": batch.name,
+            "folder_path": batch.folder_path,
+            "filters": batch_data.filters.dict()
+        }
+    )
+
+    background_tasks.add_task(
+        process_batch_resumes,
+        batch.id,
+        batch.folder_path,
+        batch_data.filters.dict(),
+        db
+    )
+
+    return batch
+
+async def process_batch_resumes(batch_id: int, folder_path: str, filters: dict, db: Session):
+    """Process batch resumes from folder"""
+    logger.info(f"🚀 Starting batch processing for batch_id: {batch_id}")
+    
+    try:
+        patterns = [
+            os.path.join(folder_path, "*.pdf"),
+            os.path.join(folder_path, "*.PDF"),
+            os.path.join(folder_path, "*.docx"),
+            os.path.join(folder_path, "*.DOCX"),
+            os.path.join(folder_path, "*.doc"),
+            os.path.join(folder_path, "*.DOC")
+        ]
+
+        files = []
+        for pattern in patterns:
+            files.extend(glob.glob(pattern))
+
+        files = list(set(files))
+        total = len(files)
+        logger.info(f"✅ Found {total} files")
+        
+        if total == 0:
+            batch = crud.get_batch(db, batch_id)
+            if batch:
+                batch.status = "error"
+                db.commit()
+            return
+
+        crud.update_batch_progress(db, batch_id, 0, total)
+        successful = 0
+        failed = 0
+
+        for idx, file_path in enumerate(files):
+            if not crud.check_batch_should_continue(db, batch_id):
+                return
+            
+            filename = os.path.basename(file_path)
+            
+            try:
+                logger.info(f"📄 Processing {idx+1}/{total}: {filename}")
+                
+                ext = os.path.splitext(file_path)[1]
+                resume_text = parser.extract_text(file_path, ext)
+                
+                if not resume_text or len(resume_text) < 100:
+                    failed += 1
+                    continue
+
+                resume_text = sanitize_text(resume_text)
+                extracted = extractor.extract_all(resume_text, filename)
+                
+                exp_years = extracted.get('experience_years', 0)
+                location = extracted.get('location', 'Not Specified')
+                
+                if not matcher.matches_filters(extracted, exp_years, location, filters):
+                    failed += 1
+                    continue
+                
+                match_score = matcher.calculate_screening_score(
+                    extracted.get('skills', []),
+                    filters.get('skills', []),
+                    exp_years,
+                    filters.get('min_experience', 0),
+                    resume_text
+                )
+                
+                email_for_hash = extracted.get('email') or ''
+                unique_hash = hashlib.md5(
+                    f"{extracted['name']}{email_for_hash}".encode()
+                ).hexdigest()
+                
+                existing = db.query(models.Potential).filter(
+                    models.Potential.batch_id == batch_id,
+                    models.Potential.unique_hash == unique_hash
+                ).first()
+                
+                if existing:
+                    failed += 1
+                    continue
+                
+                potential_data = {
+                    'unique_hash': unique_hash,
+                    'name': sanitize_text(extracted['name']),
+                    'email': sanitize_text(extracted.get('email') or ''),
+                    'phone': sanitize_text(extracted.get('phone') or ''),
+                    'skills': [sanitize_text(s) for s in extracted.get('skills', [])],
+                    'experience_years': exp_years,
+                    'location': sanitize_text(location),
+                    'education': [
+                        {k: sanitize_text(str(v)) if v else '' for k, v in edu.items()}
+                        for edu in extracted.get('education', [])
+                    ],
+                    'resume_text': sanitize_text(resume_text[:5000]),
+                    'resume_filename': sanitize_text(filename),
+                    'resume_path': file_path,
+                    'match_score': match_score
+                }
+                
+                try:
+                    crud.create_potential(db, batch_id, potential_data)
+                    db.commit()
+                    successful += 1
+                except Exception as db_error:
+                    db.rollback()
+                    failed += 1
+                
+            except Exception as e:
+                failed += 1
+                try:
+                    db.rollback()
+                except:
+                    pass
+            
+            finally:
+                try:
+                    crud.update_batch_progress(db, batch_id, idx + 1, total)
+                except:
+                    pass
+        
+        logger.info(f"🎉 Batch complete! ✅ {successful}/{total}")
+        
+    except Exception as e:
+        logger.error(f"💥 Error: {str(e)}")
+        try:
+            batch = crud.get_batch(db, batch_id)
+            if batch:
+                batch.status = "error"
+                db.commit()
+        except:
+            pass
+
+async def process_batch_resumes_resume(batch_id: int, folder_path: str, filters: dict, db: Session):
+    """Resume batch processing from where it was paused"""
+    await process_batch_resumes(batch_id, folder_path, filters, db)
 
 @app.put("/api/screening/batches/{batch_id}/pause")
 async def pause_batch_endpoint(
@@ -979,11 +896,11 @@ async def pause_batch_endpoint(
     current_user: models.User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Pause a batch that is currently processing"""
+    """Pause a batch"""
     batch = crud.pause_batch(db, batch_id, current_user.full_name)
     
     if not batch:
-        raise HTTPException(404, "Batch not found or cannot be paused")
+        raise HTTPException(404, "Batch not found")
     
     await manager.broadcast({
         "type": "batch_paused",
@@ -992,7 +909,6 @@ async def pause_batch_endpoint(
     })
     
     return batch
-
 
 @app.put("/api/screening/batches/{batch_id}/resume")
 async def resume_batch_endpoint(
@@ -1005,7 +921,7 @@ async def resume_batch_endpoint(
     batch = crud.resume_batch(db, batch_id, current_user.full_name)
     
     if not batch:
-        raise HTTPException(404, "Batch not found or cannot be resumed")
+        raise HTTPException(404, "Batch not found")
     
     background_tasks.add_task(
         process_batch_resumes_resume,
@@ -1028,7 +944,6 @@ async def resume_batch_endpoint(
     
     return batch
 
-
 @app.put("/api/screening/batches/{batch_id}/cancel")
 async def cancel_batch_endpoint(
     batch_id: int,
@@ -1039,7 +954,7 @@ async def cancel_batch_endpoint(
     batch = crud.cancel_batch(db, batch_id, current_user.full_name)
     
     if not batch:
-        raise HTTPException(404, "Batch not found or cannot be cancelled")
+        raise HTTPException(404, "Batch not found")
     
     await manager.broadcast({
         "type": "batch_cancelled",
@@ -1049,14 +964,13 @@ async def cancel_batch_endpoint(
     
     return batch
 
-
 @app.delete("/api/screening/batches/{batch_id}")
 async def delete_batch_endpoint(
     batch_id: int,
     current_user: models.User = Depends(require_permission("delete_candidate")),
     db: Session = Depends(get_db)
 ):
-    """Delete a batch and all associated data"""
+    """Delete a batch"""
     success = crud.delete_batch(db, batch_id, current_user.full_name)
     
     if not success:
@@ -1069,11 +983,9 @@ async def delete_batch_endpoint(
     
     return {"message": "Batch deleted successfully", "batch_id": batch_id}
 
-
 # ============================================
 # CANDIDATE ROUTES
 # ============================================
-
 @app.get("/api/candidates")
 def get_candidates(
     skip: int = 0,
@@ -1083,7 +995,6 @@ def get_candidates(
 ):
     """Get all candidates"""
     return crud.get_candidates(db, skip, limit)
-
 
 @app.get("/api/candidates/{candidate_id}")
 def get_candidate(
@@ -1096,7 +1007,6 @@ def get_candidate(
     if not candidate:
         raise HTTPException(404, "Candidate not found")
     return candidate
-
 
 @app.put("/api/candidates/{candidate_id}/status")
 async def update_status(
@@ -1143,16 +1053,14 @@ async def update_status(
 
     return updated
 
-
 @app.delete("/api/candidates/{candidate_id}")
 async def delete_candidate_endpoint(
     candidate_id: int,
     current_user: models.User = Depends(require_permission("delete_candidate")),
     db: Session = Depends(get_db)
 ):
-    """Permanently delete a candidate and all associated data"""
+    """Delete candidate"""
     success = crud.delete_candidate(db, candidate_id, current_user.full_name)
-    
     if not success:
         raise HTTPException(404, "Candidate not found")
     
@@ -1161,11 +1069,7 @@ async def delete_candidate_endpoint(
         "candidate_id": candidate_id
     })
     
-    return {
-        "message": "Candidate deleted successfully",
-        "candidate_id": candidate_id
-    }
-
+    return {"message": "Candidate deleted successfully", "candidate_id": candidate_id}
 
 @app.put("/api/candidates/{candidate_id}/blacklist")
 async def blacklist_candidate_endpoint(
@@ -1204,7 +1108,6 @@ async def blacklist_candidate_endpoint(
 
     return candidate
 
-
 @app.put("/api/candidates/{candidate_id}/unblacklist")
 async def unblacklist_candidate_endpoint(
     candidate_id: int,
@@ -1236,7 +1139,6 @@ async def unblacklist_candidate_endpoint(
 
     return candidate
 
-
 @app.get("/api/blacklist")
 def get_blacklist(
     skip: int = 0,
@@ -1247,11 +1149,9 @@ def get_blacklist(
     """Get all blacklisted candidates"""
     return crud.get_blacklisted_candidates(db, skip, limit)
 
-
 # ============================================
 # JOB ROUTES
 # ============================================
-
 @app.post("/api/jobs")
 async def create_job(
     job: schemas.JobDescriptionCreate,
@@ -1288,7 +1188,6 @@ async def create_job(
 
     return created_job
 
-
 @app.get("/api/jobs")
 def get_jobs(
     current_user: models.User = Depends(require_permission("view_jobs")),
@@ -1296,7 +1195,6 @@ def get_jobs(
 ):
     """Get all active jobs"""
     return crud.get_jobs(db)
-
 
 @app.get("/api/jobs/{job_id}")
 def get_job(
@@ -1310,11 +1208,9 @@ def get_job(
         raise HTTPException(404, "Job not found")
     return job
 
-
 # ============================================
 # MATCHING ROUTES
 # ============================================
-
 @app.post("/api/match")
 async def match_candidate(
     candidate_id: int,
@@ -1359,21 +1255,18 @@ async def match_candidate(
 
     return match_result
 
-
 @app.get("/api/candidates/{candidate_id}/matches")
 def get_candidate_matches(
     candidate_id: int,
     current_user: models.User = Depends(require_permission("match_candidates")),
     db: Session = Depends(get_db)
 ):
-    """Get all match results for a candidate"""
+    """Get match results for a candidate"""
     return crud.get_match_results(db, candidate_id)
-
 
 # ============================================
 # COMMENT ROUTES
 # ============================================
-
 @app.post("/api/candidates/{candidate_id}/comments")
 async def add_comment(
     candidate_id: int,
@@ -1401,7 +1294,6 @@ async def add_comment(
 
     return new_comment
 
-
 @app.get("/api/candidates/{candidate_id}/comments")
 def get_comments(
     candidate_id: int,
@@ -1410,7 +1302,6 @@ def get_comments(
 ):
     """Get comments for a candidate"""
     return crud.get_comments(db, candidate_id)
-
 
 @app.delete("/api/comments/{comment_id}")
 async def delete_comment(
@@ -1431,11 +1322,9 @@ async def delete_comment(
 
     return {"message": "Comment deleted successfully"}
 
-
 # ============================================
-# PRIVATE NOTES ROUTES
+# NOTES ROUTES
 # ============================================
-
 @app.post("/api/candidates/{candidate_id}/notes", response_model=schemas.Note)
 async def create_note(
     candidate_id: int,
@@ -1443,7 +1332,7 @@ async def create_note(
     current_user: models.User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Create a private note for a candidate"""
+    """Create a private note"""
     candidate = crud.get_candidate(db, candidate_id)
     if not candidate:
         raise HTTPException(404, "Candidate not found")
@@ -1451,16 +1340,14 @@ async def create_note(
     note = crud.create_note(db, candidate_id, current_user.id, note_data)
     return note
 
-
 @app.get("/api/candidates/{candidate_id}/notes", response_model=List[schemas.Note])
 async def get_candidate_notes(
     candidate_id: int,
     current_user: models.User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Get all private notes for a candidate"""
+    """Get private notes for a candidate"""
     return crud.get_notes_for_candidate(db, candidate_id, current_user.id)
-
 
 @app.put("/api/notes/{note_id}", response_model=schemas.Note)
 async def update_note(
@@ -1473,10 +1360,9 @@ async def update_note(
     note = crud.update_note(db, note_id, current_user.id, note_data)
 
     if not note:
-        raise HTTPException(404, "Note not found or you don't have permission")
+        raise HTTPException(404, "Note not found")
 
     return note
-
 
 @app.delete("/api/notes/{note_id}")
 async def delete_note(
@@ -1488,10 +1374,9 @@ async def delete_note(
     success = crud.delete_note(db, note_id, current_user.id)
 
     if not success:
-        raise HTTPException(404, "Note not found or you don't have permission")
+        raise HTTPException(404, "Note not found")
 
     return {"message": "Note deleted successfully"}
-
 
 @app.put("/api/notes/{note_id}/pin", response_model=schemas.Note)
 async def toggle_note_pin(
@@ -1503,10 +1388,9 @@ async def toggle_note_pin(
     note = crud.toggle_note_pin(db, note_id, current_user.id)
 
     if not note:
-        raise HTTPException(404, "Note not found or you don't have permission")
+        raise HTTPException(404, "Note not found")
 
     return note
-
 
 @app.get("/api/notes/my-notes", response_model=List[schemas.Note])
 async def get_my_notes(
@@ -1516,7 +1400,6 @@ async def get_my_notes(
 ):
     """Get all notes by current user"""
     return crud.get_all_notes_by_user(db, current_user.id, limit)
-
 
 @app.get("/api/notes/search")
 async def search_notes(
@@ -1544,7 +1427,6 @@ async def search_notes(
 
     return results
 
-
 @app.get("/api/candidates/{candidate_id}/notes/count")
 async def get_note_count(
     candidate_id: int,
@@ -1555,11 +1437,9 @@ async def get_note_count(
     count = crud.get_note_count_for_candidate(db, candidate_id, current_user.id)
     return {"count": count}
 
-
 # ============================================
 # ANALYTICS ROUTES
 # ============================================
-
 @app.get("/api/analytics")
 def get_analytics(
     current_user: models.User = Depends(require_permission("view_analytics")),
@@ -1588,11 +1468,9 @@ def get_analytics(
         "recent_count": len([c for c in candidates if (datetime.utcnow() - c.uploaded_at).days <= 7])
     }
 
-
 # ============================================
 # USER MANAGEMENT ROUTES
 # ============================================
-
 @app.get("/api/users", response_model=List[schemas.User])
 async def get_users(
     current_user: models.User = Depends(require_permission("view_users")),
@@ -1600,7 +1478,6 @@ async def get_users(
 ):
     """Get all users"""
     return db.query(models.User).all()
-
 
 @app.put("/api/users/{user_id}/role")
 async def update_user_role(
@@ -1634,7 +1511,6 @@ async def update_user_role(
 
     return user
 
-
 @app.delete("/api/users/{user_id}")
 async def deactivate_user(
     user_id: int,
@@ -1654,7 +1530,6 @@ async def deactivate_user(
 
     return {"message": "User deactivated successfully"}
 
-
 @app.get("/api/users/me/permissions")
 async def get_my_permissions(
     current_user: models.User = Depends(get_current_active_user)
@@ -1665,11 +1540,9 @@ async def get_my_permissions(
         "permissions": get_user_permissions(current_user.role)
     }
 
-
 # ============================================
 # ACTIVITY LOG ROUTES
 # ============================================
-
 @app.get("/api/activity")
 def get_recent_activity(
     limit: int = 50,
@@ -1677,7 +1550,7 @@ def get_recent_activity(
     current_user: models.User = Depends(require_permission("view_activity")),
     db: Session = Depends(get_db)
 ):
-    """Get recent activity logs (Admin and HR Manager only)"""
+    """Get recent activity logs"""
     query = db.query(models.ActivityLog).order_by(
         models.ActivityLog.timestamp.desc())
 
@@ -1687,29 +1560,6 @@ def get_recent_activity(
     activities = query.limit(limit).all()
     return activities
 
-
-# ============================================
-# ROOT ROUTE
-# ============================================
-
-@app.get("/")
-def root():
-    """Root endpoint"""
-    return {
-        "message": "Candidate Analysis System API",
-        "version": "1.0.0",
-        "status": "running",
-        "docs": "/docs"
-    }
-
-
-# ============================================
-# HEALTH CHECK
-# ============================================
-
-@app.get("/health")
-def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
-
-
+logger.info("=" * 70)
+logger.info("✅ ALL ENDPOINTS REGISTERED SUCCESSFULLY")
+logger.info("=" * 70)
