@@ -6,10 +6,10 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from . import models, schemas
 from .database import get_db
-import secrets
+import os
 
 # Configuration
-SECRET_KEY = "your-secret-key-change-in-production-use-openssl-rand-hex-32"
+SECRET_KEY = os.getenv("SECRET_KEY)"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 7
 
@@ -89,3 +89,4 @@ def require_role(allowed_roles: list):
             )
         return current_user
     return role_checker
+
