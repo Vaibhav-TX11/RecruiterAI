@@ -156,32 +156,32 @@ app.add_middleware(
 )
 logger.info(f"✅ CORS configured for {len(allowed_origins)} origins")
 
-# ============================================
-# SERVICE INITIALIZATION
-# ============================================
-logger.info("⚙️  Initializing services...")
-parser = DocumentParser()
-extractor = InformationExtractor()
-matcher = CandidateMatcher()
-logger.info("✅ Services initialized")
+# # ============================================
+# # SERVICE INITIALIZATION
+# # ============================================
+# logger.info("⚙️  Initializing services...")
+# parser = DocumentParser()
+# extractor = InformationExtractor()
+# matcher = CandidateMatcher()
+# logger.info("✅ Services initialized")
 
-# ============================================
-# FILE UPLOAD SETUP
-# ============================================
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-logger.info(f"✅ Upload directory ready: {UPLOAD_DIR}")
+# # ============================================
+# # FILE UPLOAD SETUP
+# # ============================================
+# UPLOAD_DIR = "uploads"
+# os.makedirs(UPLOAD_DIR, exist_ok=True)
+# logger.info(f"✅ Upload directory ready: {UPLOAD_DIR}")
 
-# ============================================
-# HELPER FUNCTIONS
-# ============================================
-def sanitize_text(text: str) -> str:
-    """Remove null bytes and problematic characters"""
-    if not text:
-        return ""
-    text = text.replace('\x00', '')
-    text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\t\r')
-    return text.strip()
+# # ============================================
+# # HELPER FUNCTIONS
+# # ============================================
+# def sanitize_text(text: str) -> str:
+#     """Remove null bytes and problematic characters"""
+#     if not text:
+#         return ""
+#     text = text.replace('\x00', '')
+#     text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\t\r')
+#     return text.strip()
 
 # ============================================
 # STARTUP/SHUTDOWN EVENTS
@@ -1626,5 +1626,6 @@ def get_recent_activity(
 logger.info("=" * 70)
 logger.info("✅ ALL ENDPOINTS REGISTERED SUCCESSFULLY")
 logger.info("=" * 70)
+
 
 
