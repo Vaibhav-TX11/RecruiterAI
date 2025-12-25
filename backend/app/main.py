@@ -92,23 +92,23 @@ def init_database():
     
     return True
 
-# ============================================
-# SERVICE IMPORTS
-# ============================================
-logger.info("📦 Loading services...")
-try:
-    from app.services.parser import DocumentParser
-    from app.services.extractor import InformationExtractor
-    from app.services.matcher import CandidateMatcher
-    from app.services.websocket_manager import manager
-    from app.services.storage_service import storage_service
+# # ============================================
+# # SERVICE IMPORTS
+# # ============================================
+# logger.info("📦 Loading services...")
+# try:
+#     from app.services.parser import DocumentParser
+#     from app.services.extractor import InformationExtractor
+#     from app.services.matcher import CandidateMatcher
+#     from app.services.websocket_manager import manager
+#     from app.services.storage_service import storage_service
     
-    logger.info("✅ Core services loaded")
-except Exception as e:
-    logger.error(f"❌ Service import failed: {e}")
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
+#     logger.info("✅ Core services loaded")
+# except Exception as e:
+#     logger.error(f"❌ Service import failed: {e}")
+#     import traceback
+#     traceback.print_exc()
+#     sys.exit(1)
 
 # ============================================
 # AUTH IMPORTS
@@ -1626,4 +1626,5 @@ def get_recent_activity(
 logger.info("=" * 70)
 logger.info("✅ ALL ENDPOINTS REGISTERED SUCCESSFULLY")
 logger.info("=" * 70)
+
 
