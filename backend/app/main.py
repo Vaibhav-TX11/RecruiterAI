@@ -49,21 +49,48 @@ from sqlalchemy.orm import Session
 logger.info("✅ FastAPI imports successful")
 
 # ============================================
-# DATABASE SETUP
+# LAZY DATABASE SETUP (DEFERRED CONNECTION)
 # ============================================
-logger.info("📦 Initializing database...")
-try:
-    from app.database import engine, get_db
-    from app import models, schemas, crud
+logger.info("📦 Initializing database connection (lazy)...")
+
+db_initialized = False
+engine = None
+models = None
+schemas = None
+crud = None
+get_db = None
+
+def init_database():
+    """Initialize database on first use"""
+    global db_initialized, engine, models, schemas, crud, get_db
     
-    # Create tables
-    models.Base.metadata.create_all(bind=engine)
-    logger.info("✅ Database initialized and tables created")
-except Exception as e:
-    logger.error(f"❌ Database initialization failed: {e}")
-    import traceback
-    traceback.print_exc()
-    sys.exit(1)
+    if db_initialized:
+        return
+    
+    logger.info("🔗 Connecting to database...")
+    try:
+        from app.database import engine as db_engine, get_db as db_get_db
+        from app import models as db_models, schemas as db_schemas, crud as db_crud
+        
+        engine = db_engine
+        models = db_models
+        schemas = db_schemas
+        crud = db_crud
+        get_db = db_get_db
+        
+        # Create tables
+        logger.info("🗄️ Creating database tables...")
+        models.Base.metadata.create_all(bind=engine)
+        logger.info("✅ Database initialized successfully")
+        db_initialized = True
+        
+    except Exception as e:
+        logger.error(f"❌ Database initialization failed: {e}")
+        logger.error("⚠️  Database will be retried on first request")
+        db_initialized = False
+        return False
+    
+    return True
 
 # ============================================
 # SERVICE IMPORTS
@@ -168,6 +195,10 @@ async def startup_event():
     logger.info(f"🌐 CORS Origins: {len(allowed_origins)} configured")
     logger.info(f"📁 Upload directory: {UPLOAD_DIR}")
     logger.info("=" * 70)
+    
+    # Try to initialize database, but don't fail if it doesn't work
+    if not init_database():
+        logger.warning("⚠️  Database connection will be retried on first request")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -196,11 +227,47 @@ def health_check():
         "app": "candidate-analysis-api"
     }
 
+@app.get("/health/db")
+def health_check_db():
+    """Database health check"""
+    try:
+        if init_database():
+            return {
+                "status": "healthy",
+                "database": "connected",
+                "timestamp": datetime.utcnow()
+            }
+        else:
+            return {
+                "status": "warning",
+                "database": "connection_failed",
+                "timestamp": datetime.utcnow()
+            }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "database": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow()
+        }
+
+# ============================================
+# DATABASE DEPENDENCY WITH LAZY INIT
+# ============================================
+def get_db_with_init():
+    """Get database session with lazy initialization"""
+    if not init_database():
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection failed. Check your DATABASE_URL and ensure Supabase allows connections from Render."
+        )
+    return get_db()
+
 # ============================================
 # AUTHENTICATION ROUTES
 # ============================================
 @app.post("/api/auth/register", response_model=schemas.User)
-def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
+def register(user: schemas.UserCreate, db: Session = Depends(get_db_with_init)):
     """Register a new user"""
     existing_user = crud.get_user_by_username(db, user.username)
     if existing_user:
@@ -213,7 +280,7 @@ def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
     return crud.create_user(db, user)
 
 @app.post("/api/auth/login", response_model=schemas.Token)
-def login(user_credentials: schemas.UserLogin, db: Session = Depends(get_db)):
+def login(user_credentials: schemas.UserLogin, db: Session = Depends(get_db_with_init)):
     """Login user and return JWT token"""
     user = crud.authenticate_user(db, user_credentials.username, user_credentials.password)
 
@@ -230,12 +297,12 @@ def login(user_credentials: schemas.UserLogin, db: Session = Depends(get_db)):
     }
 
 @app.get("/api/auth/me", response_model=schemas.User)
-async def get_me(current_user: models.User = Depends(get_current_active_user)):
+async def get_me(current_user = Depends(get_current_active_user)):
     """Get current user info"""
     return current_user
 
 @app.post("/api/auth/logout")
-async def logout(current_user: models.User = Depends(get_current_active_user)):
+async def logout(current_user = Depends(get_current_active_user)):
     """Logout user"""
     return {"message": "Successfully logged out"}
 
@@ -246,30 +313,36 @@ async def logout(current_user: models.User = Depends(get_current_active_user)):
 async def websocket_endpoint(
     websocket: WebSocket,
     token: str = Query(None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db_with_init)
 ):
     """WebSocket endpoint with authentication"""
-    if token:
-        from app.auth import verify_token
-        user_id = verify_token(token)
-        if user_id:
-            user = crud.get_user(db, user_id)
-            if user:
-                await manager.connect(websocket, user.full_name)
+    try:
+        if token:
+            from app.auth import verify_token
+            user_id = verify_token(token)
+            if user_id:
+                user = crud.get_user(db, user_id)
+                if user:
+                    await manager.connect(websocket, user.full_name)
+                else:
+                    await manager.connect(websocket, "Anonymous")
             else:
                 await manager.connect(websocket, "Anonymous")
         else:
             await manager.connect(websocket, "Anonymous")
-    else:
-        await manager.connect(websocket, "Anonymous")
 
-    try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
         user = manager.disconnect(websocket)
         if user:
             await manager.broadcast({"type": "user_disconnected", "user": user})
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        try:
+            await manager.disconnect(websocket)
+        except:
+            pass
 
 # ============================================
 # RESUME UPLOAD ROUTE
@@ -277,8 +350,8 @@ async def websocket_endpoint(
 @app.post("/api/resumes/upload")
 async def upload_resume(
     file: UploadFile = File(...),
-    current_user: models.User = Depends(require_permission("upload_resume")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("upload_resume")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Upload and process a resume"""
     ext = os.path.splitext(file.filename)[1]
@@ -373,7 +446,173 @@ async def upload_resume(
             os.remove(temp_path)
 
 # ============================================
-# BATCH UPLOAD ROUTES
+# CANDIDATE ROUTES (with lazy DB init)
+# ============================================
+@app.get("/api/candidates")
+def get_candidates(
+    skip: int = 0,
+    limit: int = 100,
+    current_user = Depends(require_permission("view_candidates")),
+    db: Session = Depends(get_db_with_init)
+):
+    """Get all candidates"""
+    return crud.get_candidates(db, skip, limit)
+
+@app.get("/api/candidates/{candidate_id}")
+def get_candidate(
+    candidate_id: int,
+    current_user = Depends(require_permission("view_candidates")),
+    db: Session = Depends(get_db_with_init)
+):
+    """Get specific candidate"""
+    candidate = crud.get_candidate(db, candidate_id)
+    if not candidate:
+        raise HTTPException(404, "Candidate not found")
+    return candidate
+
+@app.put("/api/candidates/{candidate_id}/status")
+async def update_status(
+    candidate_id: int,
+    update: schemas.CandidateUpdate,
+    current_user = Depends(require_permission("change_status")),
+    db: Session = Depends(get_db_with_init)
+):
+    """Update candidate status"""
+    candidate = crud.get_candidate(db, candidate_id)
+    if not candidate:
+        raise HTTPException(404, "Candidate not found")
+
+    if not can_modify_candidate(current_user, candidate, db):
+        raise HTTPException(403, "You can only modify candidates you uploaded")
+
+    updated = crud.update_candidate_status(
+        db,
+        candidate_id,
+        update.status,
+        candidate.version,
+        current_user.full_name
+    )
+
+    if not updated:
+        raise HTTPException(409, "Version conflict")
+
+    crud.create_activity_log(
+        db,
+        user=current_user.full_name,
+        action="status_change",
+        candidate_id=candidate_id,
+        details={
+            "candidate_name": updated.name,
+            "new_status": update.status
+        }
+    )
+
+    await manager.broadcast({
+        "type": "status_change",
+        "candidate_id": candidate_id,
+        "status": update.status
+    })
+
+    return updated
+
+@app.delete("/api/candidates/{candidate_id}")
+async def delete_candidate_endpoint(
+    candidate_id: int,
+    current_user = Depends(require_permission("delete_candidate")),
+    db: Session = Depends(get_db_with_init)
+):
+    """Delete candidate"""
+    success = crud.delete_candidate(db, candidate_id, current_user.full_name)
+    if not success:
+        raise HTTPException(404, "Candidate not found")
+    
+    await manager.broadcast({
+        "type": "candidate_deleted",
+        "candidate_id": candidate_id
+    })
+    
+    return {"message": "Candidate deleted successfully", "candidate_id": candidate_id}
+
+@app.put("/api/candidates/{candidate_id}/blacklist")
+async def blacklist_candidate_endpoint(
+    candidate_id: int,
+    blacklist_data: schemas.BlacklistUpdate,
+    current_user = Depends(require_permission("blacklist_candidate")),
+    db: Session = Depends(get_db_with_init)
+):
+    """Blacklist a candidate"""
+    candidate = crud.blacklist_candidate(
+        db,
+        candidate_id,
+        blacklist_data.reason,
+        current_user.full_name
+    )
+
+    if not candidate:
+        raise HTTPException(404, "Candidate not found")
+
+    crud.create_activity_log(
+        db,
+        user=current_user.full_name,
+        action="blacklisted",
+        candidate_id=candidate_id,
+        details={
+            "candidate_name": candidate.name,
+            "reason": blacklist_data.reason
+        }
+    )
+
+    await manager.broadcast({
+        "type": "candidate_blacklisted",
+        "candidate_id": candidate_id,
+        "candidate_name": candidate.name
+    })
+
+    return candidate
+
+@app.put("/api/candidates/{candidate_id}/unblacklist")
+async def unblacklist_candidate_endpoint(
+    candidate_id: int,
+    current_user = Depends(require_permission("unblacklist_candidate")),
+    db: Session = Depends(get_db_with_init)
+):
+    """Remove candidate from blacklist"""
+    candidate = crud.unblacklist_candidate(
+        db,
+        candidate_id,
+        current_user.full_name
+    )
+
+    if not candidate:
+        raise HTTPException(404, "Candidate not found")
+
+    crud.create_activity_log(
+        db,
+        user=current_user.full_name,
+        action="unblacklisted",
+        candidate_id=candidate_id,
+        details={"candidate_name": candidate.name}
+    )
+
+    await manager.broadcast({
+        "type": "candidate_unblacklisted",
+        "candidate_id": candidate_id
+    })
+
+    return candidate
+
+@app.get("/api/blacklist")
+def get_blacklist(
+    skip: int = 0,
+    limit: int = 100,
+    current_user = Depends(require_permission("view_blacklist")),
+    db: Session = Depends(get_db_with_init)
+):
+    """Get all blacklisted candidates"""
+    return crud.get_blacklisted_candidates(db, skip, limit)
+
+# ============================================
+# SCREENING ROUTES
 # ============================================
 @app.post("/api/screening/upload-batch", response_model=schemas.BatchResponse)
 async def upload_batch_files(
@@ -384,8 +623,8 @@ async def upload_batch_files(
     max_experience: int = Form(None),
     locations: str = Form("[]"),
     background_tasks: BackgroundTasks = BackgroundTasks(),
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Upload batch files"""
     import json
@@ -443,13 +682,7 @@ async def upload_batch_files(
         action="started_screening",
         details={
             "batch_name": batch.name,
-            "uploaded_files": len(uploaded_files),
-            "filters": {
-                'skills': skills_list,
-                'min_experience': min_experience,
-                'max_experience': max_experience,
-                'locations': locations_list
-            }
+            "uploaded_files": len(uploaded_files)
         }
     )
     
@@ -462,15 +695,20 @@ async def upload_batch_files(
             'min_experience': min_experience,
             'max_experience': max_experience,
             'locations': locations_list
-        },
-        db
+        }
     )
     
     return batch
 
-async def process_uploaded_batch(batch_id: int, uploaded_files: list, filters: dict, db: Session):
+async def process_uploaded_batch(batch_id: int, uploaded_files: list, filters: dict):
     """Process uploaded batch files"""
     logger.info(f"🚀 Starting batch processing for batch_id: {batch_id}")
+    
+    if not init_database():
+        logger.error("Cannot process batch - database connection failed")
+        return
+    
+    db = next(get_db())
     
     try:
         total = len(uploaded_files)
@@ -481,7 +719,6 @@ async def process_uploaded_batch(batch_id: int, uploaded_files: list, filters: d
                 db.commit()
             return
         
-        crud.update_batch_progress(db, batch_id, 0, total)
         successful = 0
         failed = 0
         
@@ -563,15 +800,12 @@ async def process_uploaded_batch(batch_id: int, uploaded_files: list, filters: d
                     crud.create_potential(db, batch_id, potential_data)
                     db.commit()
                     successful += 1
-                    logger.info(f"   ✅ Success!")
                 except Exception as db_error:
-                    logger.error(f"   ❌ Database error: {str(db_error)}")
                     db.rollback()
                     failed += 1
                 
             except Exception as e:
                 failed += 1
-                logger.error(f"   ❌ Error: {str(e)[:100]}")
                 try:
                     db.rollback()
                 except:
@@ -583,12 +817,8 @@ async def process_uploaded_batch(batch_id: int, uploaded_files: list, filters: d
                         os.unlink(temp_file_path)
                     except:
                         pass
-                try:
-                    crud.update_batch_progress(db, batch_id, idx + 1, total)
-                except:
-                    pass
         
-        logger.info(f"🎉 Batch complete! ✅ {successful}/{total} | ❌ {failed}/{total}")
+        logger.info(f"🎉 Batch complete! ✅ {successful}/{total}")
         
     except Exception as e:
         logger.error(f"💥 Batch processing error: {str(e)}")
@@ -599,17 +829,19 @@ async def process_uploaded_batch(batch_id: int, uploaded_files: list, filters: d
                 db.commit()
         except:
             pass
+    finally:
+        try:
+            db.close()
+        except:
+            pass
 
-# ============================================
-# SCREENING ROUTES
-# ============================================
 @app.get("/api/screening/potentials/{batch_id}")
 async def get_potentials(
     batch_id: int,
     page: int = 1,
     per_page: int = 100,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Get potentials for a batch"""
     potentials, total = crud.get_potentials_paginated(
@@ -632,8 +864,8 @@ async def get_potentials(
 async def update_potential_status_endpoint(
     potential_id: int,
     status_update: schemas.PotentialStatusUpdate,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Update potential status"""
     potential = crud.update_potential_status(
@@ -693,8 +925,8 @@ async def update_potential_status_endpoint(
 async def get_screening_activities_endpoint(
     batch_id: int,
     limit: int = 50,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Get screening activities"""
     return crud.get_screening_activities(db, batch_id, limit)
@@ -702,16 +934,16 @@ async def get_screening_activities_endpoint(
 @app.get("/api/screening/rejected/{batch_id}")
 async def get_rejected_list(
     batch_id: int,
-    current_user: models.User = Depends(require_permission("view_activity")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("view_activity")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Get rejected potentials"""
     return crud.get_rejected_potentials(db, batch_id)
 
 @app.get("/api/screening/batches")
 async def get_batches(
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Get all screening batches"""
     return crud.get_active_batches(db)
@@ -720,8 +952,8 @@ async def get_batches(
 async def start_screening(
     batch_data: schemas.BatchCreate,
     background_tasks: BackgroundTasks,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Start a new screening batch"""
     batch = crud.create_batch(
@@ -739,8 +971,7 @@ async def start_screening(
         action="started_screening",
         details={
             "batch_name": batch.name,
-            "folder_path": batch.folder_path,
-            "filters": batch_data.filters.dict()
+            "folder_path": batch.folder_path
         }
     )
 
@@ -748,15 +979,20 @@ async def start_screening(
         process_batch_resumes,
         batch.id,
         batch.folder_path,
-        batch_data.filters.dict(),
-        db
+        batch_data.filters.dict()
     )
 
     return batch
 
-async def process_batch_resumes(batch_id: int, folder_path: str, filters: dict, db: Session):
+async def process_batch_resumes(batch_id: int, folder_path: str, filters: dict):
     """Process batch resumes from folder"""
     logger.info(f"🚀 Starting batch processing for batch_id: {batch_id}")
+    
+    if not init_database():
+        logger.error("Cannot process batch - database connection failed")
+        return
+    
+    db = next(get_db())
     
     try:
         patterns = [
@@ -783,7 +1019,6 @@ async def process_batch_resumes(batch_id: int, folder_path: str, filters: dict, 
                 db.commit()
             return
 
-        crud.update_batch_progress(db, batch_id, 0, total)
         successful = 0
         failed = 0
 
@@ -867,12 +1102,6 @@ async def process_batch_resumes(batch_id: int, folder_path: str, filters: dict, 
                     db.rollback()
                 except:
                     pass
-            
-            finally:
-                try:
-                    crud.update_batch_progress(db, batch_id, idx + 1, total)
-                except:
-                    pass
         
         logger.info(f"🎉 Batch complete! ✅ {successful}/{total}")
         
@@ -885,16 +1114,17 @@ async def process_batch_resumes(batch_id: int, folder_path: str, filters: dict, 
                 db.commit()
         except:
             pass
-
-async def process_batch_resumes_resume(batch_id: int, folder_path: str, filters: dict, db: Session):
-    """Resume batch processing from where it was paused"""
-    await process_batch_resumes(batch_id, folder_path, filters, db)
+    finally:
+        try:
+            db.close()
+        except:
+            pass
 
 @app.put("/api/screening/batches/{batch_id}/pause")
 async def pause_batch_endpoint(
     batch_id: int,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Pause a batch"""
     batch = crud.pause_batch(db, batch_id, current_user.full_name)
@@ -914,8 +1144,8 @@ async def pause_batch_endpoint(
 async def resume_batch_endpoint(
     batch_id: int,
     background_tasks: BackgroundTasks,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Resume a paused batch"""
     batch = crud.resume_batch(db, batch_id, current_user.full_name)
@@ -924,7 +1154,7 @@ async def resume_batch_endpoint(
         raise HTTPException(404, "Batch not found")
     
     background_tasks.add_task(
-        process_batch_resumes_resume,
+        process_batch_resumes,
         batch.id,
         batch.folder_path,
         {
@@ -932,8 +1162,7 @@ async def resume_batch_endpoint(
             'min_experience': batch.filter_min_experience or 0,
             'max_experience': batch.filter_max_experience,
             'locations': batch.filter_locations or []
-        },
-        db
+        }
     )
     
     await manager.broadcast({
@@ -947,8 +1176,8 @@ async def resume_batch_endpoint(
 @app.put("/api/screening/batches/{batch_id}/cancel")
 async def cancel_batch_endpoint(
     batch_id: int,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Cancel a batch"""
     batch = crud.cancel_batch(db, batch_id, current_user.full_name)
@@ -967,8 +1196,8 @@ async def cancel_batch_endpoint(
 @app.delete("/api/screening/batches/{batch_id}")
 async def delete_batch_endpoint(
     batch_id: int,
-    current_user: models.User = Depends(require_permission("delete_candidate")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("delete_candidate")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Delete a batch"""
     success = crud.delete_batch(db, batch_id, current_user.full_name)
@@ -984,179 +1213,13 @@ async def delete_batch_endpoint(
     return {"message": "Batch deleted successfully", "batch_id": batch_id}
 
 # ============================================
-# CANDIDATE ROUTES
-# ============================================
-@app.get("/api/candidates")
-def get_candidates(
-    skip: int = 0,
-    limit: int = 100,
-    current_user: models.User = Depends(require_permission("view_candidates")),
-    db: Session = Depends(get_db)
-):
-    """Get all candidates"""
-    return crud.get_candidates(db, skip, limit)
-
-@app.get("/api/candidates/{candidate_id}")
-def get_candidate(
-    candidate_id: int,
-    current_user: models.User = Depends(require_permission("view_candidates")),
-    db: Session = Depends(get_db)
-):
-    """Get specific candidate"""
-    candidate = crud.get_candidate(db, candidate_id)
-    if not candidate:
-        raise HTTPException(404, "Candidate not found")
-    return candidate
-
-@app.put("/api/candidates/{candidate_id}/status")
-async def update_status(
-    candidate_id: int,
-    update: schemas.CandidateUpdate,
-    current_user: models.User = Depends(require_permission("change_status")),
-    db: Session = Depends(get_db)
-):
-    """Update candidate status"""
-    candidate = crud.get_candidate(db, candidate_id)
-    if not candidate:
-        raise HTTPException(404, "Candidate not found")
-
-    if not can_modify_candidate(current_user, candidate, db):
-        raise HTTPException(403, "You can only modify candidates you uploaded")
-
-    updated = crud.update_candidate_status(
-        db,
-        candidate_id,
-        update.status,
-        candidate.version,
-        current_user.full_name
-    )
-
-    if not updated:
-        raise HTTPException(409, "Version conflict")
-
-    crud.create_activity_log(
-        db,
-        user=current_user.full_name,
-        action="status_change",
-        candidate_id=candidate_id,
-        details={
-            "candidate_name": updated.name,
-            "new_status": update.status
-        }
-    )
-
-    await manager.broadcast({
-        "type": "status_change",
-        "candidate_id": candidate_id,
-        "status": update.status
-    })
-
-    return updated
-
-@app.delete("/api/candidates/{candidate_id}")
-async def delete_candidate_endpoint(
-    candidate_id: int,
-    current_user: models.User = Depends(require_permission("delete_candidate")),
-    db: Session = Depends(get_db)
-):
-    """Delete candidate"""
-    success = crud.delete_candidate(db, candidate_id, current_user.full_name)
-    if not success:
-        raise HTTPException(404, "Candidate not found")
-    
-    await manager.broadcast({
-        "type": "candidate_deleted",
-        "candidate_id": candidate_id
-    })
-    
-    return {"message": "Candidate deleted successfully", "candidate_id": candidate_id}
-
-@app.put("/api/candidates/{candidate_id}/blacklist")
-async def blacklist_candidate_endpoint(
-    candidate_id: int,
-    blacklist_data: schemas.BlacklistUpdate,
-    current_user: models.User = Depends(require_permission("blacklist_candidate")),
-    db: Session = Depends(get_db)
-):
-    """Blacklist a candidate"""
-    candidate = crud.blacklist_candidate(
-        db,
-        candidate_id,
-        blacklist_data.reason,
-        current_user.full_name
-    )
-
-    if not candidate:
-        raise HTTPException(404, "Candidate not found")
-
-    crud.create_activity_log(
-        db,
-        user=current_user.full_name,
-        action="blacklisted",
-        candidate_id=candidate_id,
-        details={
-            "candidate_name": candidate.name,
-            "reason": blacklist_data.reason
-        }
-    )
-
-    await manager.broadcast({
-        "type": "candidate_blacklisted",
-        "candidate_id": candidate_id,
-        "candidate_name": candidate.name
-    })
-
-    return candidate
-
-@app.put("/api/candidates/{candidate_id}/unblacklist")
-async def unblacklist_candidate_endpoint(
-    candidate_id: int,
-    current_user: models.User = Depends(require_permission("unblacklist_candidate")),
-    db: Session = Depends(get_db)
-):
-    """Remove candidate from blacklist"""
-    candidate = crud.unblacklist_candidate(
-        db,
-        candidate_id,
-        current_user.full_name
-    )
-
-    if not candidate:
-        raise HTTPException(404, "Candidate not found")
-
-    crud.create_activity_log(
-        db,
-        user=current_user.full_name,
-        action="unblacklisted",
-        candidate_id=candidate_id,
-        details={"candidate_name": candidate.name}
-    )
-
-    await manager.broadcast({
-        "type": "candidate_unblacklisted",
-        "candidate_id": candidate_id
-    })
-
-    return candidate
-
-@app.get("/api/blacklist")
-def get_blacklist(
-    skip: int = 0,
-    limit: int = 100,
-    current_user: models.User = Depends(require_permission("view_blacklist")),
-    db: Session = Depends(get_db)
-):
-    """Get all blacklisted candidates"""
-    return crud.get_blacklisted_candidates(db, skip, limit)
-
-# ============================================
 # JOB ROUTES
 # ============================================
 @app.post("/api/jobs")
 async def create_job(
     job: schemas.JobDescriptionCreate,
-    current_user: models.User = Depends(require_permission("create_job")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("create_job")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Create job description"""
     skills = extractor.extract_skills_hybrid(job.description)
@@ -1190,8 +1253,8 @@ async def create_job(
 
 @app.get("/api/jobs")
 def get_jobs(
-    current_user: models.User = Depends(require_permission("view_jobs")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("view_jobs")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Get all active jobs"""
     return crud.get_jobs(db)
@@ -1199,8 +1262,8 @@ def get_jobs(
 @app.get("/api/jobs/{job_id}")
 def get_job(
     job_id: int,
-    current_user: models.User = Depends(require_permission("view_jobs")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("view_jobs")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Get specific job"""
     job = crud.get_job(db, job_id)
@@ -1215,8 +1278,8 @@ def get_job(
 async def match_candidate(
     candidate_id: int,
     job_id: int,
-    current_user: models.User = Depends(require_permission("match_candidates")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("match_candidates")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Match a candidate to a job"""
     candidate = crud.get_candidate(db, candidate_id)
@@ -1258,8 +1321,8 @@ async def match_candidate(
 @app.get("/api/candidates/{candidate_id}/matches")
 def get_candidate_matches(
     candidate_id: int,
-    current_user: models.User = Depends(require_permission("match_candidates")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("match_candidates")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Get match results for a candidate"""
     return crud.get_match_results(db, candidate_id)
@@ -1271,8 +1334,8 @@ def get_candidate_matches(
 async def add_comment(
     candidate_id: int,
     comment_request: schemas.CommentCreate,
-    current_user: models.User = Depends(require_permission("add_comment")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("add_comment")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Add comment to candidate"""
     new_comment = crud.create_comment(
@@ -1297,8 +1360,8 @@ async def add_comment(
 @app.get("/api/candidates/{candidate_id}/comments")
 def get_comments(
     candidate_id: int,
-    current_user: models.User = Depends(require_permission("view_comments")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("view_comments")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Get comments for a candidate"""
     return crud.get_comments(db, candidate_id)
@@ -1306,8 +1369,8 @@ def get_comments(
 @app.delete("/api/comments/{comment_id}")
 async def delete_comment(
     comment_id: int,
-    current_user: models.User = Depends(require_permission("delete_comment")),
-    db: Session = Depends(get_db)
+    current_user = Depends(require_permission("delete_comment")),
+    db: Session = Depends(get_db_with_init)
 ):
     """Delete a comment"""
     comment = db.query(models.Comment).filter(models.Comment.id == comment_id).first()
@@ -1329,8 +1392,8 @@ async def delete_comment(
 async def create_note(
     candidate_id: int,
     note_data: schemas.NoteCreate,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Create a private note"""
     candidate = crud.get_candidate(db, candidate_id)
@@ -1343,8 +1406,8 @@ async def create_note(
 @app.get("/api/candidates/{candidate_id}/notes", response_model=List[schemas.Note])
 async def get_candidate_notes(
     candidate_id: int,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Get private notes for a candidate"""
     return crud.get_notes_for_candidate(db, candidate_id, current_user.id)
@@ -1353,8 +1416,8 @@ async def get_candidate_notes(
 async def update_note(
     note_id: int,
     note_data: schemas.NoteUpdate,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Update a note"""
     note = crud.update_note(db, note_id, current_user.id, note_data)
@@ -1367,8 +1430,8 @@ async def update_note(
 @app.delete("/api/notes/{note_id}")
 async def delete_note(
     note_id: int,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Delete a note"""
     success = crud.delete_note(db, note_id, current_user.id)
@@ -1381,8 +1444,8 @@ async def delete_note(
 @app.put("/api/notes/{note_id}/pin", response_model=schemas.Note)
 async def toggle_note_pin(
     note_id: int,
-    current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_active_user),
+    db: Session = Depends(get_db_with_init)
 ):
     """Toggle pin status of a note"""
     note = crud.toggle_note_pin(db, note_id, current_user.id)
@@ -1563,3 +1626,4 @@ def get_recent_activity(
 logger.info("=" * 70)
 logger.info("✅ ALL ENDPOINTS REGISTERED SUCCESSFULLY")
 logger.info("=" * 70)
+
