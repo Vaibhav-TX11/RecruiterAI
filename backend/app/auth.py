@@ -9,7 +9,7 @@ from .database import get_db
 import os
 
 # Configuration
-SECRET_KEY = os.getenv("SECRET_KEY)"
+SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 7
 
@@ -89,4 +89,5 @@ def require_role(allowed_roles: list):
             )
         return current_user
     return role_checker
+
 
